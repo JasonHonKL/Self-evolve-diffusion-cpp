@@ -3,7 +3,9 @@
 // friends hardcode Config::num_heads so block forwards are re-implemented
 // here with a heads parameter.
 #include "model/ovi_dit.h"
+#include "serde/sdcpp.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +16,81 @@ namespace ovi {
 namespace {
 
 constexpr float kEps = 1e-6f;
+
+// ---- #17 bench: rough wall-time split, sdpa vs gemm sections of forward.
+double g_attn_ms = 0, g_lin_ms = 0;
+bool g_time = false;
+using Clk = std::chrono::steady_clock;
+double ms_since(Clk::time_point t0) {
+  return std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+}
+
+// Per-row f32 scale view that .sdcpp packs right after the i8 weight blob
+// (sdcpp v1 layout; see tools/quantize/pack_sdcpp.py).
+Tensor scale_after(const Tensor& wq) {
+  Tensor s;
+  s.shape = {wq.rows()};
+  s.dtype = DType::F32;
+  s.data = (char*)wq.data + wq.nbytes;
+  s.nbytes = (size_t)wq.rows() * 4;
+  s.owning = false;
+  return s;
+}
+
+// 2D I8 view [r,c] of a full pack tensor (torch Linear layout kept as-is:
+// qgemm wants Bq [N=out, K=in], so NO transpose on this path).
+Tensor i8view2d(const Tensor& t, int64_t r, int64_t c) {
+  Tensor v;
+  v.shape = {r, c};
+  v.dtype = DType::I8;
+  v.data = t.data;
+  v.nbytes = (size_t)(r * c);
+  v.owning = false;
+  return v;
+}
+
+// Dequantize any-shape I8 pack view (scale rows = numel/last_dim) -> owning f32.
+Tensor dequant_pack(const Tensor& q) {
+  Tensor o(q.shape, DType::F32);
+  const int8_t* qp = q.ptr<int8_t>();
+  const float* sp = (const float*)((const char*)q.data + q.nbytes);
+  const int64_t last = q.shape.empty() ? 1 : q.shape.back();
+  float* op = o.ptr<float>();
+  parallel_for(0, q.numel(), 8192, [&](int64_t b, int64_t e) {
+    for (int64_t i = b; i < e; i++) op[i] = (float)qp[i] * sp[i / last];
+  });
+  return o;
+}
+
+// Linear dispatch: I8 weights -> sd::qgemm (+ bias), else fp32 matmul path.
+void mlin(const Tensor& x, const blk::Linear& l, Tensor& y) {
+  Clk::time_point t0;
+  if (g_time) t0 = Clk::now();
+  if (l.w.dtype == DType::I8) {
+    qgemm(x, l.w, scale_after(l.w), y);
+    if (l.b.data) {  // qgemm has no bias arg
+      int64_t M = y.rows(), N = y.cols();
+      float* yp = y.ptr<float>();
+      const float* b = l.b.ptr<float>();
+      parallel_for(0, M, 32, [&](int64_t s, int64_t e) {
+        for (int64_t i = s; i < e; i++)
+          for (int64_t j = 0; j < N; j++) yp[i * N + j] += b[j];
+      });
+    }
+  } else {
+    blk::linear(x, l, y);
+  }
+  if (g_time) g_lin_ms += ms_since(t0);
+}
+
+// sdpa + attn-section timer.
+void sdpa_t(const Tensor& q, const Tensor& k, const Tensor& v, int heads,
+            Tensor& out) {
+  Clk::time_point t0;
+  if (g_time) t0 = Clk::now();
+  blk::sdpa(q, k, v, heads, out);
+  if (g_time) g_attn_ms += ms_since(t0);
+}
 
 Tensor transp2d(const Tensor& w) {  // [m,n] -> [n,m]
   int64_t m = w.rows(), n = w.cols();
@@ -55,11 +132,13 @@ Tensor dup(const Tensor& x) {
 void gelu_tanh_inplace(Tensor& x) {
   int64_t n = x.numel();
   float* p = x.ptr<float>();
-  for (int64_t i = 0; i < n; i++) {
-    float v = p[i];
-    float u = 0.7978845608028654f * (v + 0.044715f * v * v * v);
-    p[i] = 0.5f * v * (1.f + std::tanh(u));
-  }
+  parallel_for(0, n, 4096, [&](int64_t b, int64_t e) {
+    for (int64_t i = b; i < e; i++) {
+      float v = p[i];
+      float u = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+      p[i] = 0.5f * v * (1.f + std::tanh(u));
+    }
+  });
 }
 
 void add_inplace(Tensor& x, const Tensor& y) {
@@ -97,28 +176,28 @@ void mod_rows(const Tensor& x, const Tensor& shift, const Tensor& scale,
 void self_attn_fwd(const SelfAttnW& a, const Tensor& x,
                    const blk::RopeFreqs& fr, int heads, Tensor& out) {
   Tensor q, k, v, att;
-  blk::linear(x, a.q, q);
-  blk::linear(x, a.k, k);
-  blk::linear(x, a.v, v);
+  mlin(x, a.q, q);
+  mlin(x, a.k, k);
+  mlin(x, a.v, v);
   rmsnorm(q, a.nq_w, kEps);
   rmsnorm(k, a.nk_w, kEps);
   blk::apply_rope(q, fr, heads);
   blk::apply_rope(k, fr, heads);
-  blk::sdpa(q, k, v, heads, att);
-  blk::linear(att, a.o, out);
+  sdpa_t(q, k, v, heads, att);
+  mlin(att, a.o, out);
 }
 
 // Plain t2v cross-attention on text context, no rope (model.py:268-294).
 void cross_text_fwd(const CrossAttnW& a, const Tensor& x, const Tensor& ctx,
                     int heads, Tensor& out) {
   Tensor q, k, v, att;
-  blk::linear(x, a.q, q);
-  blk::linear(ctx, a.k, k);
-  blk::linear(ctx, a.v, v);
+  mlin(x, a.q, q);
+  mlin(ctx, a.k, k);
+  mlin(ctx, a.v, v);
   rmsnorm(q, a.nq_w, kEps);
   rmsnorm(k, a.nk_w, kEps);
-  blk::sdpa(q, k, v, heads, att);
-  blk::linear(att, a.o, out);
+  sdpa_t(q, k, v, heads, att);
+  mlin(att, a.o, out);
 }
 
 // Modulated self-attn branch (model.py:454-459). e [6,dim] with ModulationAdd
@@ -136,8 +215,10 @@ void ffn_fwd(const BlockW& b, Tensor& x, const Tensor& e) {
   Tensor ln2, h, y;
   blk::layernorm(x, ln2, nullptr, nullptr, kEps);
   mod_rows(ln2, row_view(e, 3), row_view(e, 4), h);
-  b.ffn.forward(h, y);
-  gated_add_inplace(x, y, row_view(e, 5));
+  mlin(h, b.ffn.fc1, y);  // inline FFN: fc1/gelu/fc2 (I8-aware, model.py:420-422)
+  gelu_tanh_inplace(y);
+  mlin(y, b.ffn.fc2, h);
+  gated_add_inplace(x, h, row_view(e, 5));
 }
 
 // Fused cross-attn + FFN (fusion.py:72-159): text attention on ctx PLUS
@@ -151,25 +232,25 @@ void fusion_cross_ffn(const BlockW& b, Tensor& x, const Tensor& ctx,
                       const blk::RopeFreqs& fr_tgt, int heads) {
   const CrossAttnW& a = b.ca;
   Tensor q, k, v, xt;
-  blk::linear(x, a.q, q);
-  blk::linear(ctx, a.k, k);
-  blk::linear(ctx, a.v, v);
+  mlin(x, a.q, q);
+  mlin(ctx, a.k, k);
+  mlin(ctx, a.v, v);
   rmsnorm(q, a.nq_w, kEps);
   rmsnorm(k, a.nk_w, kEps);
-  blk::sdpa(q, k, v, heads, xt);
+  sdpa_t(q, k, v, heads, xt);
 
   Tensor tn, kt, vt, xtg;
   blk::layernorm(target, tn, &a.fusion.pnf_w, &a.fusion.pnf_b, kEps);
-  blk::linear(tn, a.fusion.k_fusion, kt);
-  blk::linear(tn, a.fusion.v_fusion, vt);
+  mlin(tn, a.fusion.k_fusion, kt);
+  mlin(tn, a.fusion.v_fusion, vt);
   rmsnorm(kt, a.fusion.norm_k_fusion_w, kEps);
   blk::apply_rope(q, fr_src, heads);
   blk::apply_rope(kt, fr_tgt, heads);
-  blk::sdpa(q, kt, vt, heads, xtg);
+  sdpa_t(q, kt, vt, heads, xtg);
 
   add_inplace(xt, xtg);
   Tensor co;
-  blk::linear(xt, a.o, co);
+  mlin(xt, a.o, co);
   add_inplace(x, co);
   ffn_fwd(b, x, e);
 }
@@ -234,10 +315,18 @@ void head_fwd(const BackboneW& bb, const Tensor& x, const Tensor& e_row,
     sc[c] += er[c];
   }
   mod_rows(ln, shift, scale, h);
-  blk::linear(h, bb.head, out);
+  mlin(h, bb.head, out);
 }
 
 }  // namespace
+
+void section_timers(bool on) {
+  g_time = on;
+  g_attn_ms = 0;
+  g_lin_ms = 0;
+}
+double section_ms_attn() { return g_attn_ms; }
+double section_ms_lin() { return g_lin_ms; }
 
 OviDitCfg OviDitCfg::real() {
   OviDitCfg c;
@@ -263,24 +352,39 @@ void OviDit::init(const OviDitCfg& c) {
   audio.blocks.resize(c.audio.num_layers);
 }
 
-void OviDit::load_quantized_pack(const std::string&) {
-  // TODO(#15): pack int8 weights + scales per Linear, route through sd::qgemm.
-  throw std::runtime_error(
-      "ovi_dit: quantized pack loading not yet implemented (issue #15)");
+void OviDit::load(const std::unordered_map<std::string, Tensor>& m) {
+  use_int8 = false;
+  load_impl(m);
 }
 
-void OviDit::load(const std::unordered_map<std::string, Tensor>& m) {
+void OviDit::load_quantized_pack(const std::string& path) {
+  // .sdcpp v1 (issue #15): I8 [out,in] + ".scale" for big Linears (qgemm
+  // layout directly — no transpose), raw F32 for numel<65536 tensors;
+  // quantized-along-last-dim non-Linear weights (conv/patch-embed) are
+  // dequantized to fp32 once here.
+  auto ts = load_sdcpp(path, pack_owner_);
+  use_int8 = false;
+  load_impl(ts);
+}
+
+void OviDit::load_impl(const std::unordered_map<std::string, Tensor>& m) {
   auto get = [&](const std::string& n) -> const Tensor& {
     auto it = m.find(n);
     if (it == m.end() || !it->second.data)
       throw std::runtime_error("ovi_dit: missing tensor " + n);
     return it->second;
   };
-  // bf16 -> f32 into pool_ (deque: stable refs across growth).
+  // bf16/i8 -> f32 into pool_ (deque: stable refs across growth). I8 comes
+  // from .sdcpp packs — dequantized via the scale blob packed after the i8.
   auto f32 = [&](const Tensor& t) -> const Tensor& {
     if (t.dtype == DType::F32) return t;
     Tensor o;
-    to_f32(t, o);
+    if (t.dtype == DType::I8) {
+      o = dequant_pack(t);
+      use_int8 = true;
+    } else {
+      to_f32(t, o);
+    }
     pool_.push_back(std::move(o));
     return pool_.back();
   };
@@ -293,12 +397,22 @@ void OviDit::load(const std::unordered_map<std::string, Tensor>& m) {
     if ((int64_t)t.shape.size() != 1 || (int64_t)t.dim(0) != d)
       throw std::runtime_error("ovi_dit: bad shape for " + n);
   };
-  // torch Linear [out,in] -> blk::Linear [in,out] (+ bias view).
+  // torch Linear [out,in]: F32/BF16 -> transpose to [in,out] for matmul;
+  // I8 pack view -> kept as [out,in] for sd::qgemm (scale blob follows).
   auto lin = [&](blk::Linear& l, const std::string& base, int64_t in,
                  int64_t out) {
-    const Tensor& w = f32(get(base + ".weight"));
+    const Tensor& w = get(base + ".weight");
     chk2(w, base + ".weight", out, in);
-    l.w = transp2d(w);
+    if (w.dtype == DType::I8) {
+      const Tensor& sc = get(base + ".weight.scale");  // keyed by tensor name
+      if (sc.data != (char*)w.data + w.numel())
+        throw std::runtime_error("ovi_dit: scale not packed after i8 for " +
+                                 base);
+      l.w = i8view2d(w, out, in);
+      use_int8 = true;
+    } else {
+      l.w = transp2d(f32(w));
+    }
     const Tensor& b = f32(get(base + ".bias"));
     chk1(b, base + ".bias", out);
     l.b = flat2d(b, out, 1);
@@ -509,9 +623,9 @@ void OviDit::forward(const Tensor& nv, const Tensor& na, float t,
   auto embed_ctx = [&](const BackboneW& bb, const Tensor& ctx,
                        int64_t text_len) {
     Tensor e0, e;
-    blk::linear(ctx, bb.te0, e0);
+    mlin(ctx, bb.te0, e0);
     gelu_tanh_inplace(e0);
-    blk::linear(e0, bb.te2, e);
+    mlin(e0, bb.te2, e);
     Tensor full({text_len, e.cols()}, DType::F32);
     memset(full.ptr<float>(), 0, full.nbytes);
     int64_t rows = std::min<int64_t>(text_len, e.rows());
@@ -532,16 +646,16 @@ void OviDit::forward(const Tensor& nv, const Tensor& na, float t,
       pf[j] = (float)std::cos(t * f);  // cat([cos, sin]) — model.py:24-34
       pf[half + j] = (float)std::sin(t * f);
     }
-    blk::linear(pos, bb.tm0, e);
+    mlin(pos, bb.tm0, e);
     silu_inplace(e);
     Tensor e2;
-    blk::linear(e, bb.tm2, e2);
+    mlin(e, bb.tm2, e2);
     e = std::move(e2);
     // time_projection = SiLU + Linear (model.py:633) — head keeps RAW e
     Tensor es = dup(e);
     silu_inplace(es);
     Tensor six;
-    blk::linear(es, bb.tp1, six);  // [1, 6*dim]
+    mlin(es, bb.tp1, six);  // [1, 6*dim]
     e6 = Tensor({6, (int64_t)bc.dim}, DType::F32);
     memcpy(e6.ptr<float>(), six.ptr<float>(), e6.nbytes);
   };

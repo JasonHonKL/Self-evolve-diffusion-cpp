@@ -1,6 +1,8 @@
 // UMT5-XXL encoder forward pass. See t5enc.h for architecture notes.
 #include "model/t5enc.h"
+#include <sys/mman.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -8,6 +10,8 @@
 
 namespace sd {
 namespace t5 {
+
+using Clk = std::chrono::steady_clock;
 
 static Tensor dup_f32(const Tensor& t) {  // small tensors only (norms, pos)
   Tensor o;
@@ -78,10 +82,55 @@ static void add_inplace(Tensor& x, const Tensor& y) {
   });
 }
 
+void T5Encoder::build_f32_cache() const {
+  // one-time bf16 -> f32 of every big weight (issue #17). token_embedding
+  // excluded: 4.2 GB for a gather that touches only L rows. Each converted
+  // bf16 region gets MADV_DONTNEED so peak RSS stays ~cache size, not
+  // cache+mmap (18.5GB + 7.3GB would OOM this 23GB box).
+  Clk::time_point t0 = Clk::now();
+  int64_t n = 0;
+  for (const auto& kv : st.tensors) {
+    const Tensor& t = kv.second;
+    if (t.dtype != DType::BF16 || kv.first == "token_embedding.weight") continue;
+    Tensor o(t.shape, DType::F32);
+    const uint16_t* s = t.ptr<uint16_t>();
+    float* d = o.ptr<float>();
+    // parallel (to_f32 in core is scalar; 4.6B elems would take ~minutes)
+    parallel_for(0, t.numel(), 1 << 20, [&](int64_t b, int64_t e) {
+      for (int64_t i = b; i < e; i++) {
+        uint32_t u = (uint32_t)s[i] << 16;
+        std::memcpy(&d[i], &u, 4);
+      }
+    });
+    n += t.numel();
+    w32_.emplace(kv.first, std::move(o));
+    // drop the now-shadowed bf16 file pages (clean MAP_PRIVATE: re-faults
+    // from disk if ever touched again — they aren't, except token gather)
+    uintptr_t lo = (uintptr_t)t.data & ~uintptr_t(4095);
+    uintptr_t hi = ((uintptr_t)t.data + t.nbytes + 4095) & ~uintptr_t(4095);
+    madvise((void*)lo, hi - lo, MADV_DONTNEED);
+  }
+  std::printf("[t5] f32 weight cache built: %d tensors, %.2f GB, %.1f s\n",
+              (int)w32_.size(), (double)n * 4 / 1e9,
+              std::chrono::duration<double>(Clk::now() - t0).count());
+}
+
+void T5Encoder::free_weights() {
+  // ponytail: whole-object kill switch, not fine-grained — pipeline sequences
+  // T5 strictly BEFORE the DiT loads; encoder is unusable after this call.
+  w32_.clear();
+  st = SafetensorsFile();  // releases the mmap + all bf16 views
+}
+
 void T5Encoder::forward(const Tensor& ids, const Tensor& mask, Tensor& out) const {
   const int64_t L = ids.numel();
   const float* mf = mask.ptr<float>();
   auto W = [&](const std::string& k) -> const Tensor& {
+    if (f32_cache) {
+      if (w32_.empty()) build_f32_cache();
+      auto it = w32_.find(k);
+      if (it != w32_.end()) return it->second;
+    }
     return st.tensors.at(k);
   };
 

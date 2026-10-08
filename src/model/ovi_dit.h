@@ -78,6 +78,10 @@ struct BackboneW {
 struct OviDit {
   OviDitCfg cfg;
   BackboneW video, audio;
+  // #17: true after load_quantized_pack — Linear weights may be I8 views
+  // (torch [out,in] + per-row scale packed after the i8 blob) and forward
+  // routes them through sd::qgemm; fp32 tensors keep the matmul path.
+  bool use_int8 = false;
 
   void init(const OviDitCfg& c);
   // Weight VIEWS from a safetensors-style name->Tensor map (torch layout
@@ -85,7 +89,7 @@ struct OviDit {
   void load(const std::unordered_map<std::string, Tensor>& tensors);
   // Every checkpoint key load() consumes — for coverage checks.
   std::vector<std::string> expected_keys() const;
-  // TODO(#15): int8 pack routing through sd::qgemm.
+  // .sdcpp pack: I8+scales for big Linears, raw F32 for the rest (issue #15).
   void load_quantized_pack(const std::string& path);
 
   // noise_video [C,F,H,W], noise_audio [L,C]; t scalar timestep (timestep
@@ -99,7 +103,15 @@ struct OviDit {
 
  private:
   std::deque<Tensor> pool_;  // f32 conversions made at load (stable refs)
+  std::shared_ptr<void> pack_owner_;  // sdcpp mmap keepalive for I8 views
+  void load_impl(const std::unordered_map<std::string, Tensor>& m);
 };
+
+// #17 bench hooks: rough wall-time split of forward() into sdpa (attention)
+// vs gemm (linear) sections. section_timers(true) resets the accumulators.
+void section_timers(bool on);
+double section_ms_attn();
+double section_ms_lin();
 
 }  // namespace ovi
 }  // namespace sd
