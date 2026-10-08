@@ -58,22 +58,7 @@ void to_bf16(const Tensor& f32, Tensor& out) {
   for (int64_t i = 0; i < n; i++) d[i] = f32_to_bf16_bits(s[i]);
 }
 
-void matmul(const Tensor& A, const Tensor& B, Tensor& C, const float* bias) {
-  // naive row-major reference; upgraded by issue #2
-  Tensor Af, Bf;
-  const Tensor* a = &A; const Tensor* b = &B;
-  if (A.dtype == DType::BF16) { to_f32(A, Af); a = &Af; }
-  if (B.dtype == DType::BF16) { to_f32(B, Bf); b = &Bf; }
-  int64_t M = a->rows(), K = a->cols(), N = b->cols();
-  C = Tensor({M, N}, DType::F32);
-  const float* ap = a->ptr<float>(); const float* bp = b->ptr<float>(); float* cp = C.ptr<float>();
-  for (int64_t i = 0; i < M; i++)
-    for (int64_t j = 0; j < N; j++) {
-      float s = bias ? bias[j] : 0.f;
-      for (int64_t k = 0; k < K; k++) s += ap[i*K+k] * bp[k*N+j];
-      cp[i*N+j] = s;
-    }
-}
+// matmul -> gemm.cpp, qgemm -> qgemm.cpp (issues #2/#3)
 
 void quantize_rowwise(const Tensor& W, Tensor& Wq, Tensor& scale) {
   int64_t N = W.rows(), K = W.cols();
@@ -90,20 +75,6 @@ void quantize_rowwise(const Tensor& W, Tensor& Wq, Tensor& scale) {
       }
     }
   });
-}
-
-void qgemm(const Tensor& A, const Tensor& Bq, const Tensor& bs, Tensor& out) {
-  // naive reference; AVX2 fast path by issue #3
-  int64_t M = A.rows(), K = A.cols(), N = Bq.rows();
-  out = Tensor({M, N}, DType::F32);
-  const float* a = A.ptr<float>(); const int8_t* b = Bq.ptr<int8_t>();
-  const float* s = bs.ptr<float>(); float* o = out.ptr<float>();
-  for (int64_t i = 0; i < M; i++)
-    for (int64_t j = 0; j < N; j++) {
-      int32_t acc = 0;
-      for (int64_t k = 0; k < K; k++) acc += (int32_t)std::lround(a[i*K+k]) * b[j*K+k];
-      o[i*N+j] = acc * s[j];
-    }
 }
 
 // ---- threading ----
