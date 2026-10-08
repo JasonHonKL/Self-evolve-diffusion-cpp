@@ -1,0 +1,11 @@
+Ovi/
+ckpts/
+*.mp4
+*.jpg
+*.png
+*.npz
+build/
+*.o
+*.sdcpp
+micromamba/
+.toolchain-*
