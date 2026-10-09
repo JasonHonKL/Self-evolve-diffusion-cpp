@@ -60,3 +60,30 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the issue/dependency graph.
 ## License
 
 MIT
+
+## Usage: movigen (issues #16/#18)
+
+Build the CLI (from repo root, toolchain auto-picked by the Makefile):
+
+    export PATH=$HOME/.local/bin:$PATH
+    make movigen
+
+One prompt -> mp4 (video+audio, CPU only; frames must be 4k+1):
+
+    ./build/movigen --prompt "A golden retriever puppy running on a beach, sunny day. Audio: waves and happy barking" \
+        --out out.mp4 --w 256 --h 256 --frames 9 --steps 6 --seed 42
+
+Options: `--neg-video` / `--neg-audio` override the default negative prompts
+("jitter, bad hands, blur, distortion" / "robotic, muffled, echo, distorted"),
+`--no-audio` skips the vocoder + mux, `--va-chunk N` sets the VAE decode chunk
+size (latent frames; default 2, raise for shorter/lower-res clips).
+
+Multi-scene movie with 0.5s crossfades (issue #18) — scenes JSON is a flat
+array `[{"prompt": "...", "seconds": 4.0, "seed": 123}, ...]` (`seed`
+optional, defaults to scene index):
+
+    ./build/movigen --movie scenes.json --out movie.mp4 --w 256 --h 256 --steps 6
+
+End-to-end test (one real 256x256/9-frame/4-step generation, 5-30 min):
+
+    ./build/tests/test_movigen

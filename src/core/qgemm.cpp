@@ -95,35 +95,48 @@ void qgemm(const Tensor& A, const Tensor& Bq, const Tensor& bs, Tensor& out) {
     }
   });
 
-  // widen B to s16 once when A reuse dominates (halves the cvt work in the hot loop)
-  int16_t* bq16 = nullptr;
-  if (M >= 32 && (size_t)N * K * 2 <= (size_t)1 << 28) {
-    bq16 = (int16_t*)aligned_alloc(64, ((size_t)N * K * 2 + 63) / 64 * 64);
-    parallel_for(0, N, 16, [&](int64_t b, int64_t e) {
-      for (int64_t j = b; j < e; j++) {
+  // #17: widen B to s16 only when the M rows amortize it (M >= 2048), and
+  // then per COLUMN-CHUNK task-local scratch — a full N*K panel would stream
+  // 3x weight bytes per call (read i8 + write s16 + read s16) and at model
+  // scale (11 GB of i8 per forward) that dominated wall time. Task = chunk of
+  // B rows: scratch stays L2-resident across the M loop (same cache behavior
+  // as the old full-widen, bounded memory).
+#ifndef SD_QGEMM_CHUNK
+#define SD_QGEMM_CHUNK 64
+#endif
+  if (M >= 2048) {
+    const int64_t ch = std::min<int64_t>(SD_QGEMM_CHUNK, N);
+    parallel_for(0, N, ch, [&](int64_t jb, int64_t je) {
+      const int64_t nc = je - jb;
+      int16_t* bq16 =
+          (int16_t*)aligned_alloc(64, ((size_t)nc * K * 2 + 63) / 64 * 64);
+      for (int64_t j = jb; j < je; j++) {
         const int8_t* src = bqp + j * K;
-        int16_t* dst = bq16 + j * K;
+        int16_t* dst = bq16 + (j - jb) * K;
         for (int64_t k = 0; k < K; k++) dst[k] = (int16_t)src[k];
+      }
+      for (int64_t i = 0; i < M; i++) {
+        const int8_t* ar = aq + i * K;
+        const float asc = as[i];
+        float* orow = op + i * N;
+        for (int64_t j = jb; j < je; j++)
+          orow[j] = (float)dot_s8s16(ar, bq16 + (j - jb) * K, K) *
+                    (asc * bsp[j]);
+      }
+      free(bq16);
+    });
+  } else {
+    parallel_for(0, N, 64, [&](int64_t jb, int64_t je) {
+      for (int64_t i = 0; i < M; i++) {
+        const int8_t* ar = aq + i * K;
+        const float asc = as[i];
+        float* orow = op + i * N;
+        for (int64_t j = jb; j < je; j++)
+          orow[j] = (float)dot_s8s8(ar, bqp + j * K, K) * (asc * bsp[j]);
       }
     });
   }
 
-  parallel_for(0, N, 64, [&](int64_t jb, int64_t je) {
-    for (int64_t i = 0; i < M; i++) {
-      const int8_t* ar = aq + i * K;
-      const float asc = as[i];
-      float* orow = op + i * N;
-      if (bq16) {
-        for (int64_t j = jb; j < je; j++)
-          orow[j] = (float)dot_s8s16(ar, bq16 + j * K, K) * (asc * bsp[j]);
-      } else {
-        for (int64_t j = jb; j < je; j++)
-          orow[j] = (float)dot_s8s8(ar, bqp + j * K, K) * (asc * bsp[j]);
-      }
-    }
-  });
-
-  free(bq16);
   free(aq);
   free(as);
 }

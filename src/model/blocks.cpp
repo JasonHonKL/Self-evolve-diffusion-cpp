@@ -4,6 +4,9 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
 
 namespace sd {
 namespace blk {
@@ -98,8 +101,15 @@ void apply_rope(Tensor& x, const RopeFreqs& f, int num_heads) {
   });
 }
 
-// ponytail: O(Lq*Lk*hd) per head, no flash tiling; fine at test sizes, revisit
-// with blocked softmax if real seq lens (>=36k tokens) ever run on this path.
+// #17: restructured — K transposed once into [H*hd, Lk] (contiguous rows),
+// then per head: tiled AVX2 QK^T, softmax over contiguous S rows, one fused
+// AV pass. One parallel_for over heads total (task=head); S scratch is one
+// std::vector per task.
+// ponytail: no struct workspace — parallel_for spawns fresh threads per call,
+// so a SelfAttn-member buffer would need locking; one task-local alloc per
+// head is cheaper than that. If a real thread pool lands, hoist into a
+// resize-once member. No online/blocked softmax: exact same math as before,
+// O(H*Lq*Lk) scratch.
 void sdpa(const Tensor& q, const Tensor& k, const Tensor& v, int num_heads,
           Tensor& out, bool causal) {
   int64_t Lq = q.rows(), Lk = k.rows(), C = q.cols(), hd = C / num_heads;
@@ -109,32 +119,80 @@ void sdpa(const Tensor& q, const Tensor& k, const Tensor& v, int num_heads,
   const float* kp = k.ptr<float>();
   const float* vp = v.ptr<float>();
   float* op = out.ptr<float>();
-  parallel_for(0, (int64_t)num_heads * Lq, 8, [&](int64_t bb, int64_t ee) {
+  // transposed K per head: kth[d*Lk + j] = k[j, h*hd + d]
+  Tensor kt({(int64_t)num_heads * hd, Lk}, DType::F32);
+  float* ktp = kt.ptr<float>();
+  parallel_for(0, (int64_t)num_heads, 1, [&](int64_t hb, int64_t he) {
+    for (int64_t h = hb; h < he; h++)
+      for (int64_t d = 0; d < hd; d++) {
+        const float* kr = kp + h * hd + d;
+        float* dst = ktp + (h * hd + d) * Lk;
+        for (int64_t j = 0; j < Lk; j++) dst[j] = kr[j * C];
+      }
+  });
+  parallel_for(0, (int64_t)num_heads, 1, [&](int64_t hb, int64_t he) {
     std::vector<float> sc(Lk);
-    for (int64_t idx = bb; idx < ee; idx++) {
-      int h = (int)(idx / Lq), i = (int)(idx % Lq);
-      const float* qi = qp + (int64_t)i * C + h * hd;
-      float mx = -INFINITY;
-      for (int64_t j = 0; j < Lk; j++) {
-        const float* kj = kp + j * C + h * hd;
-        float s = 0;
-        for (int64_t d = 0; d < hd; d++) s += qi[d] * kj[d];
-        s *= scale;
-        if (causal && j > i) s = -INFINITY;
-        sc[j] = s;
-        mx = std::max(mx, s);
-      }
-      float sum = 0;
-      for (int64_t j = 0; j < Lk; j++) {
-        sc[j] = std::exp(sc[j] - mx);
-        sum += sc[j];
-      }
-      float* o = op + (int64_t)i * C + h * hd;
-      for (int64_t d = 0; d < hd; d++) o[d] = 0;
-      for (int64_t j = 0; j < Lk; j++) {
-        float wgt = sc[j] / sum;
-        const float* vj = vp + j * C + h * hd;
-        for (int64_t d = 0; d < hd; d++) o[d] += wgt * vj[d];
+    for (int64_t h = hb; h < he; h++) {
+      const float* kth = ktp + h * hd * Lk;
+      for (int64_t i = 0; i < Lq; i++) {
+        const float* qi = qp + i * C + h * hd;
+        float* s = sc.data();
+#if defined(__AVX2__) && defined(__FMA__)
+        for (int64_t jt = 0; jt < Lk; jt += 8) {
+          __m256 acc = _mm256_setzero_ps();
+          for (int64_t d = 0; d < hd; d++)
+            acc = _mm256_fmadd_ps(_mm256_broadcast_ss(qi + d),
+                                  _mm256_loadu_ps(kth + d * Lk + jt), acc);
+          acc = _mm256_mul_ps(acc, _mm256_set1_ps(scale));
+          if (jt + 8 <= Lk) {
+            _mm256_storeu_ps(s + jt, acc);
+          } else {  // Lk tail
+            float tmp[8];
+            _mm256_storeu_ps(tmp, acc);
+            for (int64_t j = jt; j < Lk; j++) s[j] = tmp[j - jt];
+          }
+        }
+#else
+        for (int64_t j = 0; j < Lk; j++) {
+          float dsum = 0;
+          for (int64_t d = 0; d < hd; d++) dsum += qi[d] * kth[d * Lk + j];
+          s[j] = dsum * scale;
+        }
+#endif
+        if (causal)
+          for (int64_t j = i + 1; j < Lk; j++) s[j] = -INFINITY;
+        float mx = -INFINITY;
+        for (int64_t j = 0; j < Lk; j++) mx = std::max(mx, s[j]);
+        float sum = 0;
+        for (int64_t j = 0; j < Lk; j++) {
+          s[j] = std::exp(s[j] - mx);
+          sum += s[j];
+        }
+        float inv = 1.f / sum;
+        for (int64_t j = 0; j < Lk; j++) s[j] *= inv;
+        float* o = op + i * C + h * hd;
+#if defined(__AVX2__) && defined(__FMA__)
+        for (int64_t d0 = 0; d0 < hd; d0 += 64) {  // 2 halves: 8 acc regs each
+          __m256 acc[8];
+          for (int t = 0; t < 8; t++) acc[t] = _mm256_setzero_ps();
+          const int64_t de = std::min(d0 + 64, hd);
+          for (int64_t j = 0; j < Lk; j++) {
+            const float* vj = vp + j * C + h * hd + d0;
+            __m256 sv = _mm256_broadcast_ss(s + j);
+            for (int t = 0; t < 8 && d0 + t * 8 < de; t++)
+              acc[t] = _mm256_fmadd_ps(sv, _mm256_loadu_ps(vj + t * 8), acc[t]);
+          }
+          for (int t = 0; t < 8 && d0 + t * 8 < de; t++)
+            _mm256_storeu_ps(o + d0 + t * 8, acc[t]);
+        }
+#else
+        for (int64_t d = 0; d < hd; d++) o[d] = 0;
+        for (int64_t j = 0; j < Lk; j++) {
+          float wgt = s[j] * inv;
+          const float* vj = vp + j * C + h * hd;
+          for (int64_t d = 0; d < hd; d++) o[d] += wgt * vj[d];
+        }
+#endif
       }
     }
   });

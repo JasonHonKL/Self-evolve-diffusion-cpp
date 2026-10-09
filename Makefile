@@ -37,3 +37,13 @@ bench: $(TEST_BINS)
 
 clean:
 	rm -rf $(BUILD)
+
+# --- movigen CLI (issues #16/#18); appended, original targets untouched ---
+# movigen.cpp's main() is weak so the test bins can link the same objects.
+movigen: $(BUILD)/movigen
+all: movigen
+
+$(BUILD)/movigen: $(BUILD)/src/pipeline/movigen.o $(OBJS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< $(OBJS) -o $@ -lpthread -ldl $(if $(BLAS),$(BLAS),)
+

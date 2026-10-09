@@ -212,8 +212,20 @@ static void part_real_bench() {
            avail_gb());
     return;
   }
-  // bench inputs: video latent [48,4,8,8] -> F=4, Hp=Wp=8/2=4 -> 64 tokens
-  const int64_t F = 4, H = 8, W = 8;
+  // bench inputs: video latent [48,4,8,8] -> F=4, Hp=Wp=8/2=4 -> 64 tokens.
+  // SD_BENCH_TOKENS env (multiple of 64) scales it: 192 -> [48,3,16,16]
+  // (~256x256 x 3 frames) for the #17 perf re-bench.
+  int64_t F = 4, H = 8, W = 8;
+  if (const char* e = getenv("SD_BENCH_TOKENS")) {
+    int64_t tok = atoll(e);
+    if (tok >= 64 && tok % 64 == 0) {
+      F = tok / 64;
+      H = W = 16;  // tokens = F * 8 * 8
+    } else {
+      printf("ignore SD_BENCH_TOKENS=%lld (want multiple of 64 >= 64)\n",
+             (long long)tok);
+    }
+  }
   ovi::OviDit m;
   m.init(ovi::OviDitCfg::real());
   double t0 = now_ms();
@@ -268,6 +280,8 @@ static void part_real_bench() {
          (long long)tok_real, r, r, step_lin, step_attn, step);
   printf("50-step clip: %.1f min  (x2 for CFG: %.1f min)\n", step * 50 / 6e4,
          step * 100 / 6e4);
+  printf("4-step CFG micro-generation @%lld tok: %.1f s (8 forwards x measured step)\n",
+         (long long)tok_bench, best * 8 / 1e3);
 }
 
 int main() {

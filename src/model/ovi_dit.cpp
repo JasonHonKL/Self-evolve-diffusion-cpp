@@ -266,36 +266,31 @@ void block_vanilla_fwd(const BlockW& b, Tensor& x, const Tensor& ctx,
   ffn_fwd(b, x, e);
 }
 
-// Conv1d odd-k pad=k/2, w [out,in,k] torch layout, optional bias
-// (ChannelLastConv1d, model.py:110-116,618-622).
-void conv1d_pad(const Tensor& x, const Tensor& w, const Tensor* b, Tensor& y) {
-  int64_t L = x.rows(), Cin = x.cols(), Cout = w.dim(0), K = w.dim(2);
-  int64_t P = K / 2;
-  y = Tensor({L, Cout}, DType::F32);
-  float* yp = y.ptr<float>();
-  memset(yp, 0, y.nbytes);
-  if (b) {
-    const float* bp = b->ptr<float>();
-    for (int64_t l = 0; l < L; l++)
-      for (int64_t o = 0; o < Cout; o++) yp[l * Cout + o] = bp[o];
-  }
+// Conv1d k=7 pad=3 as im2col + one sd::matmul (#17). w is the TRANSPOSED
+// weight [Cin*7, Cout] built once at load (see load_impl's conv1d lambda);
+// cols[l, c*7+j] = x[l+j-3, c], zero outside. ChannelLastConv1d semantics,
+// model.py:110-116,618-622.
+void conv1d_mm(const Tensor& x, const Tensor& w, const Tensor* b, Tensor& y) {
+  int64_t L = x.rows(), Cin = x.cols(), K = 7, P = K / 2;
+  int64_t Cout = w.cols();
+  Tensor cols({L, Cin * K}, DType::F32);
   const float* xp = x.ptr<float>();
-  const float* wp = w.ptr<float>();
-  for (int64_t j = 0; j < K; j++) {
-    int64_t off = j - P;  // y[l] += x[l+off] @ w[:,:,j]^T
-    int64_t lo = std::max<int64_t>(0, -off);
-    int64_t hi = std::min<int64_t>(L, L - off);
-    for (int64_t l = lo; l < hi; l++) {
-      const float* xr = xp + (l + off) * Cin;
-      float* yr = yp + l * Cout;
-      for (int64_t o = 0; o < Cout; o++) {
-        const float* wr = wp + o * Cin * K + j;  // (o,c,j) at o*Cin*K + c*K + j
-        float s = 0;
-        for (int64_t c = 0; c < Cin; c++) s += xr[c] * wr[c * K];
-        yr[o] += s;
+  float* cp = cols.ptr<float>();
+  parallel_for(0, L, 8, [&](int64_t b0, int64_t e0) {
+    for (int64_t l = b0; l < e0; l++) {
+      float* row = cp + l * Cin * K;
+      for (int64_t j = 0; j < K; j++) {
+        int64_t s = l + j - P;
+        if (s < 0 || s >= L) {
+          for (int64_t c = 0; c < Cin; c++) row[c * K + j] = 0.f;
+        } else {
+          const float* xr = xp + s * Cin;
+          for (int64_t c = 0; c < Cin; c++) row[c * K + j] = xr[c];
+        }
       }
     }
-  }
+  });
+  matmul(cols, w, y, b ? b->ptr<float>() : nullptr);
 }
 
 // Head (model.py:474-501): x = head(ln(x)*(1+e1)+e0), shift/scale from
@@ -424,13 +419,51 @@ void OviDit::load_impl(const std::unordered_map<std::string, Tensor>& m) {
     dst = flat2d(t, d, 1);
     dst.shape = {d};
   };
+  // #17: conv1d weights stored TRANSPOSED [in*7, out] so forward is one
+  // im2col matmul. I8 packs dequant straight into the transposed layout (no
+  // intermediate straight copy — the w1/w3 tensors are ~700 MB fp32 each).
   auto conv1d = [&](Tensor& dst, const std::string& n, int64_t o, int64_t i) {
-    const Tensor& t = f32(get(n));
+    const Tensor& t = get(n);
     if ((int64_t)t.shape.size() != 3 || (int64_t)t.dim(2) != 7 ||
         (o >= 0 && (int64_t)t.dim(0) != o) || (i >= 0 && (int64_t)t.dim(1) != i))
       throw std::runtime_error("ovi_dit: bad shape for " + n);
-    dst = flat2d(t, (int64_t)t.dim(0), (int64_t)t.dim(1) * 7);
-    dst.shape = {(int64_t)t.dim(0), (int64_t)t.dim(1), (int64_t)7};
+    const int64_t Cout = t.dim(0), Cin7 = (int64_t)t.dim(1) * 7;
+    if (t.dtype == DType::I8) {
+      use_int8 = true;
+      const Tensor& sc = get(n + ".scale");
+      if (sc.data != (char*)t.data + t.numel())
+        throw std::runtime_error("ovi_dit: scale not packed after i8 for " + n);
+      // pack quantizes along the LAST dim: one scale per (out,in) tap vector,
+      // rows = numel/7 = Cout*Cin scales (sdcpp v1 layout)
+      const int64_t Cin = t.dim(1);
+      Tensor wT({Cin7, Cout}, DType::F32);
+      const int8_t* qp = t.ptr<int8_t>();
+      const float* sp = sc.ptr<float>();
+      float* dp = wT.ptr<float>();
+      parallel_for(0, Cout, 8, [&](int64_t b, int64_t e) {
+        for (int64_t r = b; r < e; r++) {
+          const float* srow = sp + r * Cin;
+          const int8_t* src = qp + r * Cin7;
+          for (int64_t c = 0; c < Cin; c++) {
+            const float s = srow[c];
+            float* dst = dp + c * 7 * Cout + r;
+            dst[0] = (float)src[0] * s;
+            dst[Cout] = (float)src[1] * s;
+            dst[2 * Cout] = (float)src[2] * s;
+            dst[3 * Cout] = (float)src[3] * s;
+            dst[4 * Cout] = (float)src[4] * s;
+            dst[5 * Cout] = (float)src[5] * s;
+            dst[6 * Cout] = (float)src[6] * s;
+            src += 7;
+          }
+        }
+      });
+      pool_.push_back(std::move(wT));
+    } else {
+      const Tensor& f = f32(t);  // F32 passthrough; BF16 -> f32 (pool)
+      pool_.push_back(transp2d(flat2d(f, Cout, Cin7)));
+    }
+    dst = flat2d(pool_.back(), Cin7, Cout);
   };
 
   auto load_backbone = [&](BackboneW& bb, const BackboneCfg& bc,
@@ -599,18 +632,24 @@ void OviDit::forward(const Tensor& nv, const Tensor& na, float t,
   matmul(cols, video.pe_mat, xv, video.pe_b.ptr<float>());
 
   // ---- audio patch embed: Conv1d k7 p3 -> SiLU -> ConvMLP (model.py:616-622)
+  // #17: im2col + sd::matmul (was a scalar cache-hostile conv1d: ~70 GFLOP
+  // + ~200 GB strided weight traffic per forward, ~176 s).
   const int64_t La = na.rows();
   Tensor h1, xa;
-  conv1d_pad(na, audio.pe0, &audio.pe_b, h1);
+  conv1d_mm(na, audio.pe0, &audio.pe_b, h1);
   silu_inplace(h1);
   {
     Tensor a1, a3;
-    conv1d_pad(h1, audio.ac_w1, nullptr, a1);
+    conv1d_mm(h1, audio.ac_w1, nullptr, a1);
     silu_inplace(a1);
-    conv1d_pad(h1, audio.ac_w3, nullptr, a3);
+    conv1d_mm(h1, audio.ac_w3, nullptr, a3);
     int64_t n = a1.numel();
-    for (int64_t i = 0; i < n; i++) a1.ptr<float>()[i] *= a3.ptr<float>()[i];
-    conv1d_pad(a1, audio.ac_w2, nullptr, xa);
+    parallel_for(0, n, 4096, [&](int64_t s, int64_t e) {
+      float* p1 = a1.ptr<float>();
+      const float* p3 = a3.ptr<float>();
+      for (int64_t i = s; i < e; i++) p1[i] *= p3[i];
+    });
+    conv1d_mm(a1, audio.ac_w2, nullptr, xa);
   }
 
   // ---- rope freqs (video 3D over F,Hp,Wp; audio 1D scaled)
